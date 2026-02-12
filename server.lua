@@ -3,146 +3,304 @@
 -- Version 1.0
 
 local AntiCheat = {
-    -- Configuration
-    MAX_HEALTH = 200, -- Maximum allowed health
-    MAX_ARMOR = 100,  -- Maximum allowed armor
-    TELEPORT_THRESHOLD = 100.0, -- Maximum allowed instant position change
-    WEAPON_CHECK_INTERVAL = 5000, -- How often to check for blacklisted weapons (ms)
-    
-    -- Blacklisted weapons commonly spawned by mod menus
-    blacklistedWeapons = {
-        "WEAPON_RAILGUN",
-        "WEAPON_STUNGUN",
-        "WEAPON_MINIGUN"
-    },
-    
-    -- Known mod menu triggered events
-    suspiciousEvents = {
-        "esx:getSharedObject",
-        "esx_ambulancejob:revive",
-        "esx_policejob:handcuff"
-    },
-    
-    -- Store last positions to check for teleporting
-    playerLastPositions = {}
+    lastPositions = {},
+    lastChecks = {},
+    blacklistWeapons = {},
+    blacklistWeaponsList = {},
+    blacklistVehicles = {},
+    blacklistVehiclesList = {},
+    blacklistExplosions = {},
+    bans = { list = {}, byIdentifier = {} },
+    lastLogCleanup = 0
 }
 
--- Initialize the anti-cheat system
+local function safeNumber(value, fallback)
+    if type(value) == "number" then
+        return value
+    end
+    return fallback
+end
+
 function AntiCheat:Init()
-    print([[
+    if Config and Config.EnableAntiCheat == false then
+        print("[GOD'S EYE] Anti-cheat disabled in config.")
+        return
+    end
+
+    print([[ 
     =====================================
      GOD'S EYE Anti-Cheat System
      Created by Omiya
      Protecting your server against cheaters
     =====================================
     ]])
-    
-    -- Monitor for suspicious events
-    for _, eventName in ipairs(self.suspiciousEvents) do
+
+    self.blacklistWeapons, self.blacklistWeaponsList = self:BuildHashSet(Config.BlacklistedWeapons)
+    self.blacklistVehicles, self.blacklistVehiclesList = self:BuildHashSet(Config.BlacklistedVehicles)
+    self.blacklistExplosions = self:BuildSimpleSet((Config.ExplosionProtection or {}).blacklistedExplosions)
+    self.bans = self:LoadBans()
+
+    for _, eventName in ipairs(Config.SuspiciousEvents or {}) do
         AddEventHandler(eventName, function(source)
             self:CheckSuspiciousEvent(source, eventName)
         end)
     end
-    
-    -- Start periodic checks
+
+    AddEventHandler("explosionEvent", function(sender, event)
+        self:CheckExplosion(sender, event)
+    end)
+
+    AddEventHandler("onResourceStop", function(resourceName)
+        self:CheckResourceStop(resourceName)
+    end)
+
+    AddEventHandler("playerConnecting", function(playerName, setKickReason, deferrals)
+        self:CheckPlayerConnecting(source, playerName, setKickReason, deferrals)
+    end)
+
+    AddEventHandler("playerDropped", function()
+        self:CleanupPlayer(source)
+    end)
+
     Citizen.CreateThread(function()
         while true do
-            Citizen.Wait(self.WEAPON_CHECK_INTERVAL)
             self:CheckAllPlayers()
+            Citizen.Wait(250)
         end
     end)
 end
 
--- Check a player for suspicious activity
-function AntiCheat:CheckPlayer(playerId)
-    local player = GetPlayerPed(playerId)
-    
-    -- Health check
-    local health = GetEntityHealth(player)
-    if health > self.MAX_HEALTH then
-        self:DetectCheat(playerId, "Health hack detected")
+function AntiCheat:BuildHashSet(list)
+    local set = {}
+    local hashList = {}
+    if type(list) ~= "table" then
+        return set, hashList
     end
-    
-    -- Armor check
-    local armor = GetPedArmour(player)
-    if armor > self.MAX_ARMOR then
-        self:DetectCheat(playerId, "Armor hack detected")
+    for _, name in ipairs(list) do
+        local hash = GetHashKey(name)
+        set[hash] = name
+        table.insert(hashList, hash)
     end
-    
-    -- Weapon check
-    local weapons = self:GetPlayerWeapons(playerId)
-    for _, weapon in ipairs(weapons) do
-        if self:IsWeaponBlacklisted(weapon) then
-            self:DetectCheat(playerId, "Blacklisted weapon detected: " .. weapon)
-        end
-    end
-    
-    -- Position check for teleport detection
-    local currentPos = GetEntityCoords(player)
-    if self.playerLastPositions[playerId] then
-        local lastPos = self.playerLastPositions[playerId]
-        local distance = #(currentPos - lastPos)
-        if distance > self.TELEPORT_THRESHOLD then
-            self:DetectCheat(playerId, "Possible teleport detected")
-        end
-    end
-    self.playerLastPositions[playerId] = currentPos
+    return set, hashList
 end
 
--- Check if a weapon is blacklisted
-function AntiCheat:IsWeaponBlacklisted(weapon)
-    for _, blacklisted in ipairs(self.blacklistedWeapons) do
-        if weapon == blacklisted then
-            return true
+function AntiCheat:BuildSimpleSet(list)
+    local set = {}
+    if type(list) ~= "table" then
+        return set
+    end
+    for _, value in ipairs(list) do
+        set[value] = true
+    end
+    return set
+end
+
+function AntiCheat:ShouldRunCheck(playerId, key, interval)
+    local checkInterval = safeNumber(interval, 0)
+    if checkInterval <= 0 then
+        return true
+    end
+    if not self.lastChecks[key] then
+        self.lastChecks[key] = {}
+    end
+    local now = GetGameTimer()
+    local last = self.lastChecks[key][playerId] or 0
+    if now - last >= checkInterval then
+        self.lastChecks[key][playerId] = now
+        return true
+    end
+    return false
+end
+
+function AntiCheat:IsExempt(playerId)
+    if not playerId then
+        return false
+    end
+    if IsPlayerAceAllowed and IsPlayerAceAllowed(playerId, "gods_eye.exempt") then
+        return true
+    end
+    local exemptList = Config.ExemptPlayers or {}
+    local identifiers = GetPlayerIdentifiers(playerId)
+    for _, identifier in ipairs(identifiers) do
+        for _, exempt in ipairs(exemptList) do
+            if identifier == exempt then
+                return true
+            end
         end
     end
     return false
 end
 
--- Get all weapons a player has
-function AntiCheat:GetPlayerWeapons(playerId)
-    local weapons = {}
-    for _, weapon in ipairs(self.blacklistedWeapons) do
-        if HasPedGotWeapon(GetPlayerPed(playerId), GetHashKey(weapon), false) then
-            table.insert(weapons, weapon)
+function AntiCheat:GetPrimaryIdentifier(playerId)
+    local identifiers = GetPlayerIdentifiers(playerId)
+    local license = nil
+    local steam = nil
+    local fivem = nil
+    local discord = nil
+
+    for _, identifier in ipairs(identifiers) do
+        if string.find(identifier, "license:") then
+            license = identifier
+        elseif string.find(identifier, "steam:") then
+            steam = identifier
+        elseif string.find(identifier, "fivem:") then
+            fivem = identifier
+        elseif string.find(identifier, "discord:") then
+            discord = identifier
         end
     end
-    return weapons
+
+    return license or steam or fivem or discord or identifiers[1] or tostring(playerId)
 end
 
--- Handle suspicious events
+function AntiCheat:CheckPlayer(playerId)
+    if self:IsExempt(playerId) then
+        return
+    end
+
+    local ped = GetPlayerPed(playerId)
+    if not ped or ped == 0 then
+        return
+    end
+
+    if self:ShouldRunCheck(playerId, "health", Config.HealthCheckInterval) then
+        local health = GetEntityHealth(ped)
+        if health > safeNumber(Config.MaxHealth, 200) then
+            self:DetectCheat(playerId, "Health hack detected")
+        end
+
+        local armor = GetPedArmour(ped)
+        if armor > safeNumber(Config.MaxArmor, 100) then
+            self:DetectCheat(playerId, "Armor hack detected")
+        end
+    end
+
+    if self:ShouldRunCheck(playerId, "weapons", Config.WeaponCheckInterval) then
+        for _, hash in ipairs(self.blacklistWeaponsList) do
+            if HasPedGotWeapon(ped, hash, false) then
+                local weaponName = self.blacklistWeapons[hash] or tostring(hash)
+                self:DetectCheat(playerId, "Blacklisted weapon detected: " .. weaponName)
+            end
+        end
+    end
+
+    if self:ShouldRunCheck(playerId, "position", Config.PositionCheckInterval) then
+        local currentPos = GetEntityCoords(ped)
+        local lastPos = self.lastPositions[playerId]
+        if lastPos then
+            local distance = #(currentPos - lastPos)
+            if distance > safeNumber(Config.TeleportThreshold, 100.0) then
+                self:DetectCheat(playerId, "Possible teleport detected")
+            end
+        end
+        self.lastPositions[playerId] = currentPos
+    end
+
+    if self:ShouldRunCheck(playerId, "vehicle", Config.PositionCheckInterval) then
+        local vehicle = GetVehiclePedIsIn(ped, false)
+        if vehicle and vehicle ~= 0 then
+            local model = GetEntityModel(vehicle)
+            if self.blacklistVehicles[model] then
+                local vehicleName = self.blacklistVehicles[model] or tostring(model)
+                self:DetectCheat(playerId, "Blacklisted vehicle detected: " .. vehicleName)
+            end
+
+            local maxSpeed = safeNumber(Config.MaxSpeed, 0)
+            if maxSpeed > 0 then
+                local speed = GetEntitySpeed(vehicle)
+                if speed > maxSpeed then
+                    self:DetectCheat(playerId, "Abnormal vehicle speed detected")
+                end
+            end
+        end
+    end
+end
+
+function AntiCheat:CheckAllPlayers()
+    if Config and Config.EnableAntiCheat == false then
+        return
+    end
+
+    local players = GetPlayers()
+    local processed = 0
+    local maxChecksPerTick = safeNumber((Config.Performance or {}).maxChecksPerTick, 10)
+    local checkDelay = safeNumber((Config.Performance or {}).checkDelay, 100)
+
+    for _, playerId in ipairs(players) do
+        self:CheckPlayer(playerId)
+        processed = processed + 1
+        if processed >= maxChecksPerTick then
+            processed = 0
+            Citizen.Wait(checkDelay)
+        end
+    end
+end
+
 function AntiCheat:CheckSuspiciousEvent(playerId, eventName)
-    -- Log the suspicious event
-    print(string.format("[GOD'S EYE] Suspicious event '%s' triggered by player %s", eventName, playerId))
-    
-    -- You can add additional checks here based on the event
-    -- For example, checking if the player has permission to trigger this event
-    
-    -- Example: Block certain events completely
-    if eventName == "esx:getSharedObject" then
-        self:DetectCheat(playerId, "Attempted to trigger blocked event: " .. eventName)
+    if self:IsExempt(playerId) then
+        return
+    end
+
+    self:Log(string.format("Suspicious event '%s' triggered by player %s", eventName, playerId))
+    self:DetectCheat(playerId, "Suspicious event triggered: " .. eventName)
+    CancelEvent()
+end
+
+function AntiCheat:CheckExplosion(playerId, event)
+    if not (Config.ExplosionProtection and Config.ExplosionProtection.enabled) then
+        return
+    end
+    if self:IsExempt(playerId) then
+        return
+    end
+
+    if event and self.blacklistExplosions[event.explosionType] then
+        self:DetectCheat(playerId, "Blacklisted explosion detected")
         CancelEvent()
     end
 end
 
--- Check all online players
-function AntiCheat:CheckAllPlayers()
-    local players = GetPlayers()
-    for _, playerId in ipairs(players) do
-        self:CheckPlayer(playerId)
+function AntiCheat:CheckResourceStop(resourceName)
+    if not (Config.ResourceProtection and Config.ResourceProtection.enabled) then
+        return
+    end
+    local protected = (Config.ResourceProtection.protectedResources or {})
+    for _, name in ipairs(protected) do
+        if resourceName == name then
+            self:Log("Protected resource stopped: " .. resourceName)
+            if resourceName ~= GetCurrentResourceName() then
+                StartResource(resourceName)
+            end
+            break
+        end
     end
 end
 
--- Handle detected cheats
 function AntiCheat:DetectCheat(playerId, reason)
-    -- Log the detection
-    print(string.format("[GOD'S EYE] Detected possible cheat from player %s: %s", playerId, reason))
-    
-    -- Get player identifiers for logging
+    if self:IsExempt(playerId) then
+        return
+    end
+
+    local playerName = GetPlayerName(playerId) or "Unknown"
+    self:Log(string.format("Detected possible cheat from %s (%s): %s", playerName, playerId, reason))
+    self:LogCheat(playerId, reason)
+    self:SendDiscordLog(playerId, reason)
+
+    if Config.Punishments and Config.Punishments.enabled then
+        if Config.Punishments.banPlayer then
+            self:BanPlayer(playerId, reason)
+        end
+        if Config.Punishments.kickPlayer then
+            local message = (Config.Punishments.warningMessage or "GOD'S EYE: Cheating detected!") .. " " .. reason
+            DropPlayer(playerId, message)
+        end
+    end
+end
+
+function AntiCheat:LogCheat(playerId, reason)
     local identifiers = GetPlayerIdentifiers(playerId)
     local steamId = "Unknown"
     local license = "Unknown"
-    
     for _, identifier in ipairs(identifiers) do
         if string.find(identifier, "steam:") then
             steamId = identifier
@@ -150,20 +308,7 @@ function AntiCheat:DetectCheat(playerId, reason)
             license = identifier
         end
     end
-    
-    -- Log to database or file (implement your own logging system)
-    self:LogCheat(playerId, steamId, license, reason)
-    
-    -- Take action (kick, ban, etc.)
-    -- Uncomment the following lines to enable automatic actions
-    -- DropPlayer(playerId, "GOD'S EYE: Cheating detected: " .. reason)
-    -- self:BanPlayer(playerId, reason)
-end
 
--- Log detected cheats
-function AntiCheat:LogCheat(playerId, steamId, license, reason)
-    -- Implement your own logging system here
-    -- Example: Save to a file
     local logEntry = string.format(
         "[%s] Player: %s, Steam: %s, License: %s, Reason: %s\n",
         os.date("%Y-%m-%d %H:%M:%S"),
@@ -172,17 +317,156 @@ function AntiCheat:LogCheat(playerId, steamId, license, reason)
         license,
         reason
     )
-    
-    -- Save to file (you should implement proper file handling)
-    local file = io.open("gods_eye_logs.txt", "a")
-    if file then
-        file:write(logEntry)
-        file:close()
+
+    self:WriteLog(logEntry)
+end
+
+function AntiCheat:WriteLog(entry)
+    if Config.LogToConsole then
+        print("[GOD'S EYE] " .. entry:gsub("\n", ""))
+    end
+    if not Config.LogToFile then
+        return
+    end
+
+    local fileName = Config.LogFileName or "gods_eye_logs.txt"
+    local resourceName = GetCurrentResourceName()
+    local existing = LoadResourceFile(resourceName, fileName) or ""
+
+    local cleanupHours = safeNumber((Config.Performance or {}).logCleanupInterval, 0)
+    if cleanupHours > 0 then
+        local now = os.time()
+        if self.lastLogCleanup == 0 then
+            self.lastLogCleanup = now
+        elseif now - self.lastLogCleanup >= cleanupHours * 3600 then
+            existing = ""
+            self.lastLogCleanup = now
+        end
+    end
+
+    local maxSizeMb = safeNumber((Config.Performance or {}).maxLogSize, 10)
+    local maxBytes = math.max(0, math.floor(maxSizeMb * 1024 * 1024))
+    local newContent = existing .. entry
+    if maxBytes > 0 and #newContent > maxBytes then
+        newContent = string.sub(newContent, #newContent - maxBytes + 1)
+    end
+
+    SaveResourceFile(resourceName, fileName, newContent, -1)
+end
+
+function AntiCheat:SendDiscordLog(playerId, reason)
+    if not (Config.Discord and Config.Discord.enabled) then
+        return
+    end
+    -- Placeholder: implement HTTP POST to Discord webhook here if desired.
+    self:Log("Discord logging enabled but not implemented. Reason: " .. reason)
+end
+
+function AntiCheat:LoadBans()
+    local fileName = Config.BanFileName or "gods_eye_bans.json"
+    local resourceName = GetCurrentResourceName()
+    local raw = LoadResourceFile(resourceName, fileName)
+    if not raw or raw == "" then
+        return { list = {}, byIdentifier = {} }
+    end
+    local decoded = json.decode(raw)
+    if type(decoded) ~= "table" then
+        return { list = {}, byIdentifier = {} }
+    end
+
+    local bans = { list = decoded, byIdentifier = {} }
+    for _, ban in ipairs(bans.list) do
+        if ban.identifiers then
+            for _, identifier in ipairs(ban.identifiers) do
+                bans.byIdentifier[identifier] = ban
+            end
+        end
+    end
+    return bans
+end
+
+function AntiCheat:SaveBans()
+    local fileName = Config.BanFileName or "gods_eye_bans.json"
+    local resourceName = GetCurrentResourceName()
+    SaveResourceFile(resourceName, fileName, json.encode(self.bans.list), -1)
+end
+
+function AntiCheat:PurgeExpiredBans()
+    local now = os.time()
+    local newList = {}
+    local newMap = {}
+    for _, ban in ipairs(self.bans.list) do
+        if not ban.expiresAt or ban.expiresAt == 0 or ban.expiresAt > now then
+            table.insert(newList, ban)
+            if ban.identifiers then
+                for _, identifier in ipairs(ban.identifiers) do
+                    newMap[identifier] = ban
+                end
+            end
+        end
+    end
+    self.bans.list = newList
+    self.bans.byIdentifier = newMap
+end
+
+function AntiCheat:BanPlayer(playerId, reason)
+    self:PurgeExpiredBans()
+
+    local identifiers = GetPlayerIdentifiers(playerId)
+    local banDuration = safeNumber(Config.Punishments and Config.Punishments.banDuration, 0)
+    local expiresAt = 0
+    if banDuration > 0 then
+        expiresAt = os.time() + (banDuration * 3600)
+    end
+
+    local banEntry = {
+        identifiers = identifiers,
+        primary = self:GetPrimaryIdentifier(playerId),
+        name = GetPlayerName(playerId) or "Unknown",
+        reason = reason,
+        createdAt = os.time(),
+        expiresAt = expiresAt
+    }
+
+    table.insert(self.bans.list, banEntry)
+    for _, identifier in ipairs(identifiers) do
+        self.bans.byIdentifier[identifier] = banEntry
+    end
+    self:SaveBans()
+end
+
+function AntiCheat:CheckPlayerConnecting(playerId, playerName, setKickReason, deferrals)
+    self:PurgeExpiredBans()
+    local identifiers = GetPlayerIdentifiers(playerId)
+    for _, identifier in ipairs(identifiers) do
+        local ban = self.bans.byIdentifier[identifier]
+        if ban then
+            if deferrals then
+                deferrals.defer()
+                Citizen.Wait(0)
+                deferrals.done("GOD'S EYE: You are banned. Reason: " .. (ban.reason or "Unknown"))
+            else
+                setKickReason("GOD'S EYE: You are banned. Reason: " .. (ban.reason or "Unknown"))
+            end
+            return
+        end
     end
 end
 
--- Initialize the anti-cheat system
-AntiCheat:Init()
+function AntiCheat:CleanupPlayer(playerId)
+    self.lastPositions[playerId] = nil
+    for _, bucket in pairs(self.lastChecks) do
+        if type(bucket) == "table" then
+            bucket[playerId] = nil
+        end
+    end
+end
 
--- Export the AntiCheat object if needed
+function AntiCheat:Log(message)
+    if Config.LogToConsole then
+        print("[GOD'S EYE] " .. message)
+    end
+end
+
+AntiCheat:Init()
 _G.AntiCheat = AntiCheat
