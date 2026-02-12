@@ -1,6 +1,6 @@
 # God's Eye Anti-Cheat
 
-An advanced protection system against mod menu exploits in GTA RP servers, specifically designed for QBCore Framework.
+An advanced protection system against mod menu exploits in GTA RP servers, specifically designed for QBCore/Qbx Framework.
 
 ![God's Eye Banner](https://github.com/SL-oomiBoy/God-s-Eye-Anti-Cheat/blob/main/images/logo.png)
 
