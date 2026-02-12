@@ -17,7 +17,7 @@ God's Eye Anti-Cheat is a comprehensive security solution designed to protect yo
 - **Suspicious Event Monitoring**: Tracks and blocks potentially harmful event triggers
 - **Resource Protection**: Prevents unauthorized stopping or restarting of critical resources
 - **Anti-Explosion Protection**: Controls explosion events to prevent mass destruction
-- **Discord Integration**: Real-time notifications through Discord webhooks
+- **Discord Integration**: Placeholder (ready for webhook implementation)
 - **Comprehensive Logging**: Detailed logs of all detected violations
 - **Configurable Punishment System**: Customizable responses including kicks and bans
 - **Admin Exemption System**: Whitelist for staff members
@@ -39,14 +39,14 @@ God's Eye Anti-Cheat features extensive configuration options through the `confi
 
 1. Download the latest release
 2. Extract the folder to your server's resources directory
-3. Add `ensure gods_eye_anticheat` to your server.cfg
+3. Add `ensure <folder_name>` to your server.cfg (use the actual resource folder name)
 4. Configure the settings in `config.lua` to match your server's needs
 5. Restart your server
 
 ## Requirements
 
 - FiveM Server
-- QBCore Framework
+- QBX/QBCore Framework
 
 ## Support
 

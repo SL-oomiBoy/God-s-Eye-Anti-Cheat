@@ -6,6 +6,7 @@ Config.Debug = false                    -- Enable debug messages
 Config.LogToConsole = true             -- Print detections to console
 Config.LogToFile = true                -- Save detections to file
 Config.LogFileName = "gods_eye_logs.txt"
+Config.BanFileName = "gods_eye_bans.json"
 
 -- Check Intervals (in milliseconds)
 Config.WeaponCheckInterval = 5000       -- How often to check for blacklisted weapons
@@ -39,11 +40,7 @@ Config.BlacklistedVehicles = {
 
 -- Suspicious Events to Monitor
 Config.SuspiciousEvents = {
-    "esx:getSharedObject",
-    "esx_ambulancejob:revive",
-    "esx_policejob:handcuff",
-    "esx_society:withdrawMoney",
-    "esx_mafiajob:confiscatePlayerItem"
+    -- Add custom events you want to block/log here
 }
 
 -- Punishment Settings
@@ -91,9 +88,10 @@ Config.ExplosionProtection = {
 Config.ResourceProtection = {
     enabled = true,
     protectedResources = {
-        "es_extended",
-        "esx_policejob",
-        "esx_ambulancejob"
+        "qbx_core",
+        "qb-core",
+        "qb-policejob",
+        "qb-ambulancejob"
     }
 }
 
